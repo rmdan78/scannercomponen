@@ -4,45 +4,155 @@ from PIL import Image
 import numpy as np
 import os
 from datetime import datetime
+import re
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+import requests
+import io
 
+# --- CONFIGURATION & SETUP ---
+st.set_page_config(page_title="Scanner Komponen", page_icon="📷")
+
+# Initialize Session State
+if 'logged_in' not in st.session_state:
+    st.session_state['logged_in'] = False
+if 'user_name' not in st.session_state:
+    st.session_state['user_name'] = ""
+if 'user_nik' not in st.session_state:
+    st.session_state['user_nik'] = ""
+if 'current_scan' not in st.session_state:
+    st.session_state['current_scan'] = None # Stores {'number': '...', 'image_name': '...'}
+
+# Helper: Check Login
+def check_login(nik, password):
+    try:
+        if not os.path.exists("users.csv"):
+            st.error("Database user (users.csv) tidak ditemukan.")
+            return False
+            
+        users = pd.read_csv("users.csv", dtype=str)
+        # Find user
+        user = users[(users['nik'] == nik) & (users['password'] == password)]
+        
+        if not user.empty:
+            st.session_state['logged_in'] = True
+            st.session_state['user_name'] = user.iloc[0]['name']
+            st.session_state['user_nik'] = user.iloc[0]['nik']
+            return True
+        else:
+            return False
+    except Exception as e:
+        st.error(f"Error login: {e}")
+        return False
+
+# Helper: Google Sheets Client
+def get_gspread_client():
+    scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+    
+    # Check for credentials file
+    creds_file = 'Credentials.json'
+    if not os.path.exists(creds_file):
+        creds_file = 'credentials.json'
+
+    # Try Local File first (prioritized based on previous context) or Secrets
+    if os.path.exists(creds_file):
+        try:
+            creds = ServiceAccountCredentials.from_json_keyfile_name(creds_file, scope)
+            return gspread.authorize(creds)
+        except Exception as e:
+            # st.error(f"Local Auth Error: {e}")
+            return None
+    elif "gcp_service_account" in st.secrets:
+        try:
+            creds_dict = st.secrets["gcp_service_account"]
+            creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+            return gspread.authorize(creds)
+        except Exception:
+            return None
+    
+    return None
+
+# Helper: Save Data
+def save_data(component_number, name, quantity, image_name="N/A", nik=""):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Data structure
+    new_row = {
+        "Timestamp": timestamp,
+        "Nama Pengambil": name,
+        "Component Number": component_number,
+        "Quantity": quantity,
+        "Image Name": image_name
+    }
+    
+    # 1. Google Sheets (Global / Centralized)
+    client = get_gspread_client()
+    if client:
+        try:
+            try:
+                sheet = client.open("Data Scan").sheet1
+            except gspread.SpreadsheetNotFound:
+                st.warning("Spreadsheet 'Data Scan' tidak ditemukan/belum dishare.")
+                sheet = None
+            
+            if sheet:
+                sheet.append_row([timestamp, name, component_number, quantity, image_name])
+                st.toast(f"✅ Saved to Google Sheets")
+        except Exception as e:
+            st.error(f"❌ GSheets Error: {e}")
+    else:
+        st.warning("⚠️ Google Sheets offline.")
+
+    # 2. Local Excel (Per User/NIK)
+    try:
+        # Construct filename based on NIK
+        # If NIK is empty for some reason, fallback to 'unknown'
+        safe_nik = nik if nik else "unknown"
+        file_path_xlsx = f"data_{safe_nik}.xlsx"
+        
+        df_new = pd.DataFrame([new_row])
+        
+        if os.path.exists(file_path_xlsx):
+            df_existing = pd.read_excel(file_path_xlsx)
+            df_final = pd.concat([df_existing, df_new], ignore_index=True)
+        else:
+            df_final = df_new
+        df_final.to_excel(file_path_xlsx, index=False)
+        st.toast(f"✅ Saved to Excel ({safe_nik})")
+    except Exception as e:
+        st.error(f"❌ Excel Error: {e}")
+        
+        # 3. CSV Fallback
+        try:
+            safe_nik = nik if nik else "unknown"
+            file_path_csv = f"data_{safe_nik}.csv"
+            mode = 'a' if os.path.exists(file_path_csv) else 'w'
+            header = not os.path.exists(file_path_csv)
+            df_new.to_csv(file_path_csv, mode=mode, header=header, index=False)
+            st.toast(f"✅ Saved to CSV ({safe_nik})")
+        except Exception:
+            pass
+
+# --- OCR ENGINE SETUP ---
 try:
     import cv2
 except ImportError:
     cv2 = None
-    st.error("OpenCV (cv2) not installed. Logic using it will fail.")
 
-# Initialize EasyOCR reader with error handling
 @st.cache_resource
 def load_reader():
     try:
         import easyocr
+        with st.spinner("Loading OCR Engine..."):
+            return easyocr.Reader(['en'])
     except ImportError:
-        # st.error("EasyOCR not installed. Please run `pip install easyocr`.")
         return None
-        
-    with st.spinner("Downloading/Loading OCR Model (this may take a while first time)..."):
-        return easyocr.Reader(['en'])
 
-# Try to load reader but don't crash if it fails
 reader = load_reader()
 
-import requests
-import io
-
-def ocr_space_api(image_bytes, api_key='helloworld', overlay=False, language='eng'):
-    """ OCR.space API request with local file.
-        :param image_bytes: byte content of the image
-        :param api_key: OCR.space API key. Defaults to 'helloworld'.
-        :param language: Language code to be used in OCR.
-        :return: Result in JSON format.
-    """
+def ocr_space_api(image_bytes, api_key='helloworld', language='eng'):
     try:
-        payload = {
-            'isOverlayRequired': overlay,
-            'apikey': api_key,
-            'language': language,
-            'OCREngine': 2
-        }
+        payload = {'isOverlayRequired': False, 'apikey': api_key, 'language': language, 'OCREngine': 2}
         r = requests.post(
             'https://api.ocr.space/parse/image',
             files={'filename': ('image.jpg', image_bytes, 'image/jpeg')},
@@ -52,215 +162,161 @@ def ocr_space_api(image_bytes, api_key='helloworld', overlay=False, language='en
     except Exception as e:
         return {"IsErroredOnProcessing": True, "ErrorMessage": [str(e)]}
 
-if reader is None:
-    st.warning("Local OCR (EasyOCR) not available. Switching to Cloud OCR (requires internet).")
 
+# --- MAIN UI LOGIC ---
 
-import re
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-
-# Google Sheets Setup
-def get_gspread_client():
-    scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+if not st.session_state['logged_in']:
+    # === LOGIN PAGE ===
+    st.title("🔐 Login Scanner")
     
-    # 1. Try Streamlit Secrets (Best for Deployment)
-    if "gcp_service_account" in st.secrets:
-        try:
-            creds_dict = st.secrets["gcp_service_account"]
-            creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-            return gspread.authorize(creds)
-        except Exception as e:
-            st.error(f"Secrets Auth Error: {e}")
-            return None
-
-    # 2. Try Local File (Best for Local Dev)
-    # Check for both cases (Windows is insensitive, but Linux is sensitive)
-    creds_file = 'Credentials.json'
-    if not os.path.exists(creds_file):
-        creds_file = 'credentials.json'
-
-    if os.path.exists(creds_file):
-        try:
-            creds = ServiceAccountCredentials.from_json_keyfile_name(creds_file, scope)
-            return gspread.authorize(creds)
-        except Exception as e:
-            st.error(f"Local Auth Error: {e}")
-            return None
-    else:
-        # Debug info if file not found
-        # st.warning(f"File credential not found: {creds_file}")
-        pass
-            
-    return None
-
-def save_data(component_number, image_name="N/A"):
-    # Try Excel, fallback to CSV, AND Google Sheets
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    data = {
-        "Timestamp": [timestamp],
-        "Component Number": [component_number],
-        "Image Name": [image_name]
-    }
-    df_new = pd.DataFrame(data)
-    
-    # 1. Google Sheets (Priority if enabled)
-    client = get_gspread_client()
-    if client:
-        try:
-            # Assumes spreadsheet name is 'Data Scan'. User must create/share it.
-            # Or we can use open_by_key if user provides it. 
-            # For simplicity, let's look for a sheet named "Data Scan"
-            try:
-                sheet = client.open("Data Scan").sheet1
-            except gspread.SpreadsheetNotFound:
-                # Try to create it? No, service accounts can't easily own files visible to user without sharing.
-                # Just warn.
-                st.warning("Spreadsheet 'Data Scan' tidak ditemukan di akun service account. Pastikan sudah dibagikan ke email service account.")
-                sheet = None
-            
-            if sheet:
-                sheet.append_row([timestamp, component_number, image_name])
-                st.success(f"✅ Saved to Google Sheets: {component_number}")
-        except Exception as e:
-            st.error(f"❌ Error saving to Google Sheets: {e}")
-    else:
-        st.warning("⚠️ Google Sheets tidak tersimpan: Klien tidak terhubung (Cek Credentials.json).")
-            
-    # 2. Local Excel
-    try:
-        file_path_xlsx = "data.xlsx"
-        if os.path.exists(file_path_xlsx):
-            df_existing = pd.read_excel(file_path_xlsx)
-            df_final = pd.concat([df_existing, df_new], ignore_index=True)
-        else:
-            df_final = df_new
-        df_final.to_excel(file_path_xlsx, index=False)
-        st.success(f"✅ Saved to Excel: {component_number}")
-    except Exception:
-        # 3. Fallback CSV
-        try:
-            file_path_csv = "data.csv"
-            mode = 'a' if os.path.exists(file_path_csv) and os.path.getsize(file_path_csv) > 0 else 'w'
-            header = mode == 'w'
-            df_new.to_csv(file_path_csv, mode=mode, header=header, index=False)
-            st.success(f"✅ Saved to CSV: {component_number}")
-        except Exception as e_csv:
-            st.error(f"❌ Save Failed: {e_csv}")
-
-st.set_page_config(page_title="Scanner Komponen", page_icon="📷")
-
-st.title("📷 Admin Scanner Komponen")
-st.markdown("Scan nomor komponen dan simpan otomatis ke **Excel/CSV** & **Google Sheets**.")
-
-col1, col2 = st.columns([1, 1])
-
-with col1:
-    st.subheader("Input Gambar")
-    input_method = st.radio("Pilih Metode:", ["Kamera Langsung", "Upload Foto"], horizontal=True)
-    
-    img_file_buffer = None
-    if input_method == "Kamera Langsung":
-        img_file_buffer = st.camera_input("Ambil Foto Komponen")
-        if img_file_buffer is None:
-             st.caption("Jika kamera tidak muncul di HP via Network URL, gunakan opsi 'Upload Foto' atau setting browser untuk ijinkan insecure origin.")
-    else:
-        img_file_buffer = st.file_uploader("Upload Foto Komponen", type=['jpg', 'jpeg', 'png'])
-
-with col2:
-    st.subheader("Hasil / Log")
-    if img_file_buffer is not None:
-        # Load image with PIL
-        image = Image.open(img_file_buffer)
-        image_np = np.array(image)
+    with st.form("login_form"):
+        nik = st.text_input("NIK")
+        password = st.text_input("Password", type="password")
+        submit = st.form_submit_button("Login")
         
-        with st.status('Sedang memproses OCR (Cloud/Local)...', expanded=True) as status:
-            try:
-                detected_text = None
+        if submit:
+            if check_login(nik, password):
+                st.success("Login Berhasil!")
+                st.rerun()
+            else:
+                st.error("NIK atau Password salah!")
                 
-                # Check if we can use local OCR
-                if reader is not None:
-                    status.write("Menganalisa gambar (Offline)...")
-                    result = reader.readtext(image_np, detail=0)
-                    if result:
-                        detected_text = " ".join(result)
-                else:
-                    # Fallback to API
-                    status.write("Menganalisa gambar (Cloud API)...")
-                    # Convert image to bytes
-                    img_byte_arr = io.BytesIO()
-                    image.save(img_byte_arr, format='JPEG')
-                    img_byte_arr = img_byte_arr.getvalue()
-                    
-                    api_result = ocr_space_api(img_byte_arr)
-                    
-                    if api_result.get("IsErroredOnProcessing"):
-                         st.error(f"API Error: {api_result.get('ErrorMessage')}")
-                    else:
-                        parsed_results = api_result.get("ParsedResults")
-                        if parsed_results:
-                            detected_text = parsed_results[0].get("ParsedText")
-                            # Sanitize newline characters
-                            detected_text = detected_text.replace("\r\n", " ").strip()
+else:
+    # === APP PAGE ===
+    st.sidebar.title(f"👤 {st.session_state['user_name']}")
+    if st.sidebar.button("Logout"):
+        st.session_state['logged_in'] = False
+        st.session_state['current_scan'] = None
+        st.session_state['user_nik'] = ""
+        st.rerun()
+        
+    st.title("📷 Scanner Komponen")
+    st.markdown(f"User: **{st.session_state['user_name']}**")
+    
+    col1, col2 = st.columns([1, 1])
+    
+    with col1:
+        st.subheader("1. Scan / Upload")
+        input_method = st.radio("Metode:", ["Kamera", "Upload"], horizontal=True, label_visibility="collapsed")
+        
+        img_file_buffer = None
+        if input_method == "Kamera":
+            img_file_buffer = st.camera_input("Ambil Foto")
+        else:
+            img_file_buffer = st.file_uploader("Upload Foto", type=['jpg', 'png'])
 
-                if detected_text:
-                    # Regex Validation: Find 7 digit number
-                    # Simply look for any 7 digit sequence
+        # Reset current scan if raw input changes (simple heuristic)
+        # Note: In Streamlit, camera_input triggers rerun on every snap.
+        
+    with col2:
+        st.subheader("2. Verifikasi & Simpan")
+        
+        if img_file_buffer is not None:
+            # Simple heuristic: If image buffer changes (not perfect in Streamlit but works for basic flows)
+            # We rely on session state 'current_scan' to persist validity.
+            
+            image = Image.open(img_file_buffer)
+            st.image(image, caption="Uploaded Image", width=200)
+            
+            # --- OCR PROCESS ---
+            # Run OCR only if we haven't already captured a valid number OR if we want to support rescan
+            # Ideally, we run OCR if current_scan is None.
+            
+            if st.session_state['current_scan'] is None:
+                with st.spinner("Membaca Teks..."):
+                    detected_text = ""
+                    image_np = np.array(image)
+                    
+                    # 1. Local OCR
+                    if reader:
+                        res = reader.readtext(image_np, detail=0)
+                        if res: detected_text = " ".join(res)
+                    
+                    # 2. Cloud OCR Fallback
+                    if not detected_text:
+                        img_byte_arr = io.BytesIO()
+                        image.save(img_byte_arr, format='JPEG')
+                        api_res = ocr_space_api(img_byte_arr.getvalue())
+                        if not api_res.get("IsErroredOnProcessing"):
+                            parsed = api_res.get("ParsedResults")
+                            if parsed: detected_text = parsed[0].get("ParsedText").replace("\r\n", " ")
+
+                    # Regex Extraction (First 7 digits only)
                     matches = re.findall(r'\d{7}', detected_text)
-                    
-                    final_number = None
                     if matches:
-                        # Automatically take the first one
-                        final_number = matches[0]
-                        # Optional: Log if multiple found in sidebar/console, but keep UI clean
-                        # if len(matches) > 1:
-                        #     print(f"Multiple matches found: {matches}, taking first.")
+                        found_number = matches[0]
+                        st.session_state['current_scan'] = {
+                            'number': found_number,
+                            'image_name': getattr(img_file_buffer, 'name', 'camera_capture.jpg')
+                        }
+                        st.rerun() # Force rerun to show the form
                     else:
-                        st.warning(f"Teks terdeteksi: '{detected_text}', tapi TIDAK ADA angka 7 digit.")
-
-                    if final_number:
-                        status.write(f"Valid Validasi (7 Digit): {final_number}")
-                        save_data(final_number, "Camera Input")
-                        status.update(label="Selesai!", state="complete", expanded=True)
-                        st.toast(f"Tersimpan: {final_number}")
-                    else:
-                         status.update(label="Gagal Validasi", state="error", expanded=True)
-                else:
-                    status.update(label="Gagal: Tidak ada teks", state="error", expanded=True)
-                    st.warning("⚠️ Tidak ada teks yang terdeteksi.")
+                        st.warning("⚠️ Tidak ditemukan angka 7 digit.")
+                        st.caption(f"Teks terbaca: {detected_text}")
+            
+            # --- CONFIRMATION FORM ---
+            if st.session_state['current_scan']:
+                scan_data = st.session_state['current_scan']
+                
+                st.success(f"✅ Terdeteksi: **{scan_data['number']}**")
+                
+                with st.form("save_form"):
+                    qty = st.number_input("Jumlah (Pcs)", min_value=1, value=1)
                     
-            except Exception as e:
-                status.update(label="Error", state="error")
-                st.error(f"Error processing image: {e}")
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        if st.form_submit_button("💾 SIMPAN DATA"):
+                            save_data(
+                                scan_data['number'], 
+                                st.session_state['user_name'], 
+                                qty, 
+                                scan_data['image_name'],
+                                st.session_state['user_nik'] # Pass Session NIK
+                            )
+                            st.session_state['current_scan'] = None # Reset
+                            st.rerun()
+                            
+                    with c2:
+                        if st.form_submit_button("❌ BATAL / SCAN ULANG"):
+                            st.session_state['current_scan'] = None
+                            st.rerun()
 
-
-st.divider()
-
-st.subheader("📋 Data Tersimpan")
-try:
-    if os.path.exists("data.xlsx"):
-        df = pd.read_excel("data.xlsx")
-        st.dataframe(df.sort_values(by="Timestamp", ascending=False), height=300)
-    elif os.path.exists("data.csv"):
-        # Read CSV with headers if it was created with headers
+    st.divider()
+    # Dynamic Data View based on NIK
+    nik_str = st.session_state['user_nik']
+    st.subheader(f"Data Hari Ini (NIK: {nik_str})")
+    
+    user_file_xlsx = f"data_{nik_str}.xlsx"
+    user_file_csv = f"data_{nik_str}.csv"
+    
+    data_found = False
+    
+    if os.path.exists(user_file_xlsx):
         try:
-            df = pd.read_csv("data.csv")
-            st.dataframe(df.sort_values(by="Timestamp", ascending=False), height=300)
+            df = pd.read_excel(user_file_xlsx)
+            st.dataframe(df.sort_values(by="Timestamp", ascending=False).head(5))
+            data_found = True
         except Exception:
-             st.write("Data CSV raw:")
-             st.write(pd.read_csv("data.csv"))
-    else:
-        st.info("Belum ada data tersimpan.")
-except Exception as e:
-    st.error(f"Error loading data: {e}")
+            pass
+            
+    if not data_found and os.path.exists(user_file_csv):
+         try:
+             df = pd.read_csv(user_file_csv)
+             st.dataframe(df.sort_values(by="Timestamp", ascending=False).head(5))
+             data_found = True
+         except Exception:
+             pass
+             
+    if not data_found:
+        st.info(f"Belum ada data tersimpan untuk NIK {nik_str}.")
 
-with st.expander("Opsi Data"):
-    if st.button("Hapus Semua Data"):
-        try:
-            if os.path.exists("data.xlsx"):
-                os.remove("data.xlsx")
-            if os.path.exists("data.csv"):
-                os.remove("data.csv")
-            st.rerun()
-        except Exception as e:
-            st.error(f"Gagal menghapus: {e}")
+    with st.expander("Opsi Data"):
+        if st.button("Hapus Data Saya"):
+            try:
+                if os.path.exists(user_file_xlsx):
+                    os.remove(user_file_xlsx)
+                if os.path.exists(user_file_csv):
+                    os.remove(user_file_csv)
+                st.rerun()
+            except Exception as e:
+                st.error(f"Gagal menghapus: {e}")
