@@ -75,13 +75,22 @@ def get_gspread_client():
             return None
 
     # 2. Try Local File (Best for Local Dev)
-    if os.path.exists('credentials.json'):
+    # Check for both cases (Windows is insensitive, but Linux is sensitive)
+    creds_file = 'Credentials.json'
+    if not os.path.exists(creds_file):
+        creds_file = 'credentials.json'
+
+    if os.path.exists(creds_file):
         try:
-            creds = ServiceAccountCredentials.from_json_keyfile_name('credentials.json', scope)
+            creds = ServiceAccountCredentials.from_json_keyfile_name(creds_file, scope)
             return gspread.authorize(creds)
         except Exception as e:
             st.error(f"Local Auth Error: {e}")
             return None
+    else:
+        # Debug info if file not found
+        # st.warning(f"File credential not found: {creds_file}")
+        pass
             
     return None
 
@@ -115,6 +124,8 @@ def save_data(component_number, image_name="N/A"):
                 st.success(f"✅ Saved to Google Sheets: {component_number}")
         except Exception as e:
             st.error(f"❌ Error saving to Google Sheets: {e}")
+    else:
+        st.warning("⚠️ Google Sheets tidak tersimpan: Klien tidak terhubung (Cek Credentials.json).")
             
     # 2. Local Excel
     try:
@@ -194,7 +205,7 @@ with col2:
 
                 if detected_text:
                     # Regex Validation: Find 7 digit number
-                    matches = re.findall(r'\b\d{7}\b', detected_text)
+                    matches = re.findall(r'\\b\\d{7}\\b', detected_text)
                     
                     final_number = None
                     if matches:
