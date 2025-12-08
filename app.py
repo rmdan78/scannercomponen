@@ -205,15 +205,16 @@ with col2:
 
                 if detected_text:
                     # Regex Validation: Find 7 digit number
-                    matches = re.findall(r'\\b\\d{7}\\b', detected_text)
+                    # Simply look for any 7 digit sequence
+                    matches = re.findall(r'\d{7}', detected_text)
                     
                     final_number = None
                     if matches:
-                        if len(matches) > 1:
-                            st.warning(f"Ditemukan beberapa angka 7-digit: {matches}. Mengambil yang pertama.")
-                            final_number = matches[0]
-                        else:
-                            final_number = matches[0]
+                        # Automatically take the first one
+                        final_number = matches[0]
+                        # Optional: Log if multiple found in sidebar/console, but keep UI clean
+                        # if len(matches) > 1:
+                        #     print(f"Multiple matches found: {matches}, taking first.")
                     else:
                         st.warning(f"Teks terdeteksi: '{detected_text}', tapi TIDAK ADA angka 7 digit.")
 
