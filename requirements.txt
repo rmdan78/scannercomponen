@@ -1,0 +1,6 @@
+streamlit
+pandas
+openpyxl
+easyocr
+opencv-python-headless
+Pillow
