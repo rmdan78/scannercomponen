@@ -1,0 +1,9 @@
+streamlit
+pandas
+openpyxl
+easyocr
+opencv-python-headless
+Pillow
+requests
+gspread
+oauth2client
