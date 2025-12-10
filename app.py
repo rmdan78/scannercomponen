@@ -193,7 +193,7 @@ else:
     st.title("📷 Scanner Komponen")
     st.markdown(f"User: **{st.session_state['user_name']}**")
     
-    col1, col2 = st.columns([1, 1])
+    col1, col2 = st.columns([2, 1])
     
     with col1:
         st.subheader("1. Scan / Upload")
