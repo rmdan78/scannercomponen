@@ -11,7 +11,7 @@ import requests
 import io
 
 # --- CONFIGURATION & SETUP ---
-st.set_page_config(page_title="Scanner Komponen", page_icon="📷")
+st.set_page_config(page_title="Scanner Komponen", page_icon="📷", layout="centered")
 
 # Initialize Session State
 if 'logged_in' not in st.session_state:
@@ -56,7 +56,7 @@ def get_gspread_client():
     return None
 
 # Helper: Save Data
-def save_data(component_number, operator_nik, operator_name, quantity, item_name="", image_name="N/A", session_nik=""):
+def save_data(component_number, operator_nik, operator_name, quantity, item_name="", image_name="N/A", session_nik="", reason=""):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
     # Data structure
@@ -67,7 +67,10 @@ def save_data(component_number, operator_nik, operator_name, quantity, item_name
         "Component Number": component_number,
         "Nama Barang": item_name,
         "Quantity": quantity,
-        "Image Name": image_name
+        "Nama Barang": item_name,
+        "Quantity": quantity,
+        "Image Name": image_name,
+        "Keterangan": reason
     }
     
     # 1. Google Sheets (Global / Centralized)
@@ -81,7 +84,7 @@ def save_data(component_number, operator_nik, operator_name, quantity, item_name
                 sheet = None
             
             if sheet:
-                sheet.append_row([timestamp, operator_nik, operator_name, component_number, item_name, quantity, image_name])
+                sheet.append_row([timestamp, operator_nik, operator_name, component_number, item_name, quantity, reason])
                 st.toast(f"✅ Saved to Google Sheets")
         except Exception as e:
             st.error(f"❌ GSheets Error: {e}")
@@ -137,6 +140,48 @@ def load_reader():
 
 reader = load_reader()
 
+# --- THEME LOGIC ---
+def get_theme_css(theme):
+    if theme == "Gelap":
+        return """
+        <style>
+        /* Dark Mode Override */
+        [data-testid="stAppViewContainer"] {
+            background-color: #0e1117;
+            color: #fafafa;
+        }
+        [data-testid="stSidebar"] {
+            background-color: #262730;
+            color: #fafafa;
+        }
+        [data-testid="stHeader"] {
+            background-color: rgba(0,0,0,0);
+        }
+        .stTextInput > div > div > input, .stNumberInput > div > div > input, .stTextArea > div > div > textarea {
+            background-color: #262730;
+            color: #fafafa;
+        }
+        </style>
+        """
+    else:
+        return """
+        <style>
+        /* Light Mode Override (Default-ish but enforced) */
+        [data-testid="stAppViewContainer"] {
+            background-color: #ffffff;
+            color: #31333F;
+        }
+        [data-testid="stSidebar"] {
+            background-color: #f0f2f6;
+            color: #31333F;
+        }
+        [data-testid="stHeader"] {
+            background-color: rgba(0,0,0,0);
+        }
+        </style>
+        """
+
+
 def ocr_space_api(image_bytes, api_key='helloworld', language='eng'):
     try:
         payload = {'isOverlayRequired': False, 'apikey': api_key, 'language': language, 'OCREngine': 2}
@@ -167,6 +212,11 @@ if st.session_state.get('user_name') != current_user_name:
 
 # Sidebar Navigation
 st.sidebar.title("Menu")
+
+# Theme Toggle
+theme_choice = st.sidebar.select_slider("Tampilan", options=["Terang", "Gelap"], value="Terang")
+st.markdown(get_theme_css(theme_choice), unsafe_allow_html=True)
+
 page = st.sidebar.radio("Pilih Halaman:", ["Scanner", "Riwayat Pengambilan"])
 
 if page == "Scanner":
@@ -374,6 +424,7 @@ if page == "Scanner":
     
             with st.form("save_form"):
                 qty = st.number_input("Jumlah (Pcs)", min_value=1, value=1)
+                reason = st.text_area("Keterangan / Keperluan:", placeholder="Contoh: Penggantian part mesin A...")
                 
                 c1, c2 = st.columns(2)
                 with c1:
@@ -386,7 +437,8 @@ if page == "Scanner":
                                 qty, 
                                 scan_data.get('description', ''), # Item Name
                                 scan_data['image_name'],
-                                st.session_state['user_nik'] # Session NIK
+                                st.session_state['user_nik'], # Session NIK
+                                reason # Reason
                             )
                             st.session_state['current_scan'] = None # Reset
                             st.rerun()
@@ -466,7 +518,7 @@ elif page == "Riwayat Pengambilan":
                     df_filtered['Operator'] = df_filtered['NIK Operator']
 
             # Select and Rename Columns
-            cols_to_show = ['Timestamp', 'Component Number', 'Nama Barang', 'Quantity', 'Operator']
+            cols_to_show = ['Timestamp', 'Component Number', 'Nama Barang', 'Quantity', 'Keterangan', 'Operator']
             # Ensure columns exist (handle legacy data)
             existing_cols = [c for c in cols_to_show if c in df_filtered.columns or c == 'Operator']
             
@@ -477,6 +529,7 @@ elif page == "Riwayat Pengambilan":
                     "Component Number": "No. Komponen",
                     "Nama Barang": "Nama Komponen",
                     "Quantity": "Qty",
+                    "Keterangan": "Ket.",
                     "Operator": "Operator"
                 },
                 hide_index=True,
