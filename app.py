@@ -23,27 +23,10 @@ if 'user_nik' not in st.session_state:
 if 'current_scan' not in st.session_state:
     st.session_state['current_scan'] = None # Stores {'number': '...', 'image_name': '...'}
 
-# Helper: Check Login
+# Helper: Check Login (DEPRECATED/BYPASSED)
 def check_login(nik, password):
-    try:
-        if not os.path.exists("users.csv"):
-            st.error("Database user (users.csv) tidak ditemukan.")
-            return False
-            
-        users = pd.read_csv("users.csv", dtype=str)
-        # Find user
-        user = users[(users['nik'] == nik) & (users['password'] == password)]
-        
-        if not user.empty:
-            st.session_state['logged_in'] = True
-            st.session_state['user_name'] = user.iloc[0]['name']
-            st.session_state['user_nik'] = user.iloc[0]['nik']
-            return True
-        else:
-            return False
-    except Exception as e:
-        st.error(f"Error login: {e}")
-        return False
+    # Simplified for legacy compatibility if called, but we are bypassing login
+    return True
 
 # Helper: Google Sheets Client
 def get_gspread_client():
@@ -73,14 +56,16 @@ def get_gspread_client():
     return None
 
 # Helper: Save Data
-def save_data(component_number, name, quantity, image_name="N/A", nik=""):
+def save_data(component_number, operator_nik, operator_name, quantity, item_name="", image_name="N/A", session_nik=""):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
     # Data structure
     new_row = {
         "Timestamp": timestamp,
-        "Nama Pengambil": name,
+        "NIK Operator": operator_nik,
+        "Nama Operator": operator_name,
         "Component Number": component_number,
+        "Nama Barang": item_name,
         "Quantity": quantity,
         "Image Name": image_name
     }
@@ -96,7 +81,7 @@ def save_data(component_number, name, quantity, image_name="N/A", nik=""):
                 sheet = None
             
             if sheet:
-                sheet.append_row([timestamp, name, component_number, quantity, image_name])
+                sheet.append_row([timestamp, operator_nik, operator_name, component_number, item_name, quantity, image_name])
                 st.toast(f"✅ Saved to Google Sheets")
         except Exception as e:
             st.error(f"❌ GSheets Error: {e}")
@@ -105,9 +90,11 @@ def save_data(component_number, name, quantity, image_name="N/A", nik=""):
 
     # 2. Local Excel (Per User/NIK)
     try:
-        # Construct filename based on NIK
-        # If NIK is empty for some reason, fallback to 'unknown'
-        safe_nik = nik if nik else "unknown"
+        # Construct filename based on Session NIK (usually 'general' or logged in user)
+        # We use session_nik for the filename to keep files organized by the device/session user if needed,
+        # or we could use operator_nik. But usually session_nik is safer for file locking if multiple people use same device?
+        # Let's stick to session_nik for filename but save operator_nik inside.
+        safe_nik = session_nik if session_nik else "unknown"
         file_path_xlsx = f"data_{safe_nik}.xlsx"
         
         df_new = pd.DataFrame([new_row])
@@ -124,7 +111,7 @@ def save_data(component_number, name, quantity, image_name="N/A", nik=""):
         
         # 3. CSV Fallback
         try:
-            safe_nik = nik if nik else "unknown"
+            safe_nik = session_nik if session_nik else "unknown"
             file_path_csv = f"data_{safe_nik}.csv"
             mode = 'a' if os.path.exists(file_path_csv) else 'w'
             header = not os.path.exists(file_path_csv)
@@ -165,62 +152,128 @@ def ocr_space_api(image_bytes, api_key='helloworld', language='eng'):
 
 # --- MAIN UI LOGIC ---
 
-if not st.session_state['logged_in']:
-    # === LOGIN PAGE ===
-    st.title("🔐 Login Scanner")
-    
-    with st.form("login_form"):
-        nik = st.text_input("NIK")
-        password = st.text_input("Password", type="password")
-        submit = st.form_submit_button("Login")
-        
-        if submit:
-            if check_login(nik, password):
-                st.success("Login Berhasil!")
-                st.rerun()
-            else:
-                st.error("NIK atau Password salah!")
-                
-else:
-    # === APP PAGE ===
-    st.sidebar.title(f"👤 {st.session_state['user_name']}")
-    if st.sidebar.button("Logout"):
-        st.session_state['logged_in'] = False
-        st.session_state['current_scan'] = None
-        st.session_state['user_nik'] = ""
-        st.rerun()
-        
+# Bypass Login
+# st.session_state['logged_in'] = True (Implicitly treated as logged in)
+current_user_name = "Operator"
+current_user_nik = "general"
+
+# Sync session state if needed (optional but good for consistency)
+if st.session_state.get('user_name') != current_user_name:
+    st.session_state['user_name'] = current_user_name
+    st.session_state['user_nik'] = current_user_nik
+    st.session_state['logged_in'] = True
+
+# === APP PAGE ===
+
+# Sidebar Navigation
+st.sidebar.title("Menu")
+page = st.sidebar.radio("Pilih Halaman:", ["Scanner", "Riwayat Pengambilan"])
+
+if page == "Scanner":
     st.title("📷 Scanner Komponen")
     st.markdown(f"User: **{st.session_state['user_name']}**")
     
     col1, col2 = st.columns([2, 1])
     
     with col1:
-        st.subheader("1. Scan / Upload")
-        input_method = st.radio("Metode:", ["Kamera", "Upload"], horizontal=True, label_visibility="collapsed")
+        st.subheader("1. Input Data")
+        # Removed "Upload Foto" option
+        input_method = st.radio("Metode:", ["Scan Kamera", "Input Manual / Ketik"], horizontal=True, label_visibility="collapsed")
         
         img_file_buffer = None
-        if input_method == "Kamera":
+        manual_code_input = ""
+        
+        if input_method == "Scan Kamera":
             img_file_buffer = st.camera_input("Ambil Foto")
-        else:
-            img_file_buffer = st.file_uploader("Upload Foto", type=['jpg', 'png'])
-
+        elif input_method == "Input Manual / Ketik":
+            manual_code_input = st.text_input("Masukkan Kode (7 Digit):", max_chars=7)
+    
         # Reset current scan if raw input changes (simple heuristic)
         # Note: In Streamlit, camera_input triggers rerun on every snap.
         
     with col2:
         st.subheader("2. Verifikasi & Simpan")
         
+        # --- DATABASE VALIDATION ---
+        valid_part = False
+        part_description = ""
+        
+        # Load Database (Cached)
+        @st.cache_data
+        def load_spareparts_db():
+            db_path = "Data_sparepart.csv"
+            if os.path.exists(db_path):
+                try:
+                    # Read as string to ensure matching works correctly
+                    df_db = pd.read_csv(db_path, dtype=str)
+                    return df_db
+                except Exception:
+                    return None
+            return None
+    
+        df_parts = load_spareparts_db()
+    
+        # --- DATABASE VALIDATION ---
+        valid_part = False
+        part_description = ""
+        
+        # Load Spareparts Database (Cached)
+        @st.cache_data
+        def load_spareparts_db():
+            db_path = "Data_sparepart.csv"
+            if os.path.exists(db_path):
+                try:
+                    df_db = pd.read_csv(db_path, dtype=str)
+                    return df_db
+                except Exception:
+                    return None
+            return None
+    
+        # Load Operator Database (Cached)
+        @st.cache_data
+        def load_operator_db():
+            db_path = "operator.csv"
+            if os.path.exists(db_path):
+                try:
+                    # Assuming columns: Personnel Number, Salutation, Name
+                    df_op = pd.read_csv(db_path, dtype=str)
+                    return df_op
+                except Exception:
+                    return None
+            return None
+    
+        df_parts = load_spareparts_db()
+        df_operators = load_operator_db()
+    
+        # --- HANDLING MANUAL INPUT ---
+        if input_method == "Input Manual / Ketik" and manual_code_input:
+            if len(manual_code_input) == 7 and manual_code_input.isdigit():
+                 # Validate against DB
+                 if df_parts is not None:
+                     part_match = df_parts[df_parts['Material'] == manual_code_input]
+                     if not part_match.empty:
+                         valid_part = True
+                         part_description = part_match.iloc[0]['Material Description']
+                     else:
+                         st.error(f"❌ Komponen {manual_code_input} tidak ditemukan di database!")
+                 else:
+                     st.error("⚠️ Database Data_sparepart.csv tidak ditemukan.")
+    
+                 if valid_part:
+                     # Create a 'fake' scan state for manual input
+                     if st.session_state['current_scan'] is None or st.session_state['current_scan']['number'] != manual_code_input:
+                        st.session_state['current_scan'] = {
+                            'number': manual_code_input,
+                            'image_name': "Manual Input",
+                            'description': part_description
+                        }
+                        st.rerun()
+            elif len(manual_code_input) > 0:
+                st.warning("⚠️ Masukkan 7 digit angka.")
+                
+        # --- HANDLING CAMERA ---
         if img_file_buffer is not None:
-            # Simple heuristic: If image buffer changes (not perfect in Streamlit but works for basic flows)
-            # We rely on session state 'current_scan' to persist validity.
-            
             image = Image.open(img_file_buffer)
-            st.image(image, caption="Uploaded Image", width=200)
-            
-            # --- OCR PROCESS ---
-            # Run OCR only if we haven't already captured a valid number OR if we want to support rescan
-            # Ideally, we run OCR if current_scan is None.
             
             if st.session_state['current_scan'] is None:
                 with st.spinner("Membaca Teks..."):
@@ -240,83 +293,238 @@ else:
                         if not api_res.get("IsErroredOnProcessing"):
                             parsed = api_res.get("ParsedResults")
                             if parsed: detected_text = parsed[0].get("ParsedText").replace("\r\n", " ")
-
+    
                     # Regex Extraction (First 7 digits only)
                     matches = re.findall(r'\d{7}', detected_text)
                     if matches:
                         found_number = matches[0]
-                        st.session_state['current_scan'] = {
-                            'number': found_number,
-                            'image_name': getattr(img_file_buffer, 'name', 'camera_capture.jpg')
-                        }
-                        st.rerun() # Force rerun to show the form
+                        
+                        # Validate against DB
+                        if df_parts is not None:
+                            part_match = df_parts[df_parts['Material'] == found_number]
+                            if not part_match.empty:
+                                part_description = part_match.iloc[0]['Material Description']
+                                st.session_state['current_scan'] = {
+                                    'number': found_number,
+                                    'image_name': getattr(img_file_buffer, 'name', 'camera_capture.jpg'),
+                                    'description': part_description
+                                }
+                                st.rerun() # Force rerun to show the form
+                            else:
+                                 st.error(f"❌ Komponen {found_number} terbaca tapi tidak ada di database.")
+                        else:
+                            st.error("⚠️ Database Data_sparepart.csv tidak ditemukan.")
+                            
                     else:
                         st.warning("⚠️ Tidak ditemukan angka 7 digit.")
                         st.caption(f"Teks terbaca: {detected_text}")
             
-            # --- CONFIRMATION FORM ---
-            if st.session_state['current_scan']:
-                scan_data = st.session_state['current_scan']
+        # --- CONFIRMATION FORM ---
+        if st.session_state['current_scan']:
+            scan_data = st.session_state['current_scan']
+            
+            st.success(f"✅ Data: **{scan_data['number']}**")
+            if 'description' in scan_data:
+                st.info(f"📦 {scan_data['description']}")
                 
-                st.success(f"✅ Terdeteksi: **{scan_data['number']}**")
+            # --- NIK INPUT & VALIDATION (Outside Form for interactivity) ---
+            st.caption("Masukkan Detail Pengambil:")
+            input_nik = st.text_input("NIK Operator (6 Digit)", max_chars=6, placeholder="Contoh: 123456", key="nik_input")
+            
+            valid_nik = False
+            operator_name = ""
+            
+            if input_nik and len(input_nik) == 6 and input_nik.isdigit():
+                if df_operators is not None:
+                    op_match = df_operators[df_operators['Personnel Number'] == input_nik]
+                    if not op_match.empty:
+                        valid_nik = True
+                        operator_name = op_match.iloc[0]['Name']
+                        st.info(f"👤 Operator: **{operator_name}**")
+                        
+                        # --- SHOW HISTORY FOR THIS NIK ---
+                        # Load current data file
+                        nik_str = st.session_state['user_nik']
+                        user_file_xlsx = f"data_{nik_str}.xlsx"
+                        user_file_csv = f"data_{nik_str}.csv"
+                        df_history = pd.DataFrame()
+                        
+                        if os.path.exists(user_file_xlsx):
+                            try: df_history = pd.read_excel(user_file_xlsx)
+                            except: pass
+                        elif os.path.exists(user_file_csv):
+                            try: df_history = pd.read_csv(user_file_csv)
+                            except: pass
+                            
+                        if not df_history.empty and "NIK Operator" in df_history.columns:
+                            # Filter by NIK (ensure string comparison)
+                            df_history['NIK Operator'] = df_history['NIK Operator'].astype(str)
+                            user_history = df_history[df_history['NIK Operator'] == input_nik]
+                            
+                            if not user_history.empty:
+                                with st.expander(f"Riwayat Pengambilan ({len(user_history)})"):
+                                    st.dataframe(user_history[['Timestamp', 'Nama Barang', 'Quantity']].sort_values(by="Timestamp", ascending=False).head(5))
+                            else:
+                                st.caption("Belum ada riwayat pengambilan.")
+                    else:
+                        st.error("❌ NIK tidak terdaftar!")
+                else:
+                    st.warning("⚠️ Database operator tidak ditemukan.")
+                    valid_nik = True # Allow if DB missing
+    
+            with st.form("save_form"):
+                qty = st.number_input("Jumlah (Pcs)", min_value=1, value=1)
                 
-                with st.form("save_form"):
-                    qty = st.number_input("Jumlah (Pcs)", min_value=1, value=1)
-                    
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        if st.form_submit_button("💾 SIMPAN DATA"):
+                c1, c2 = st.columns(2)
+                with c1:
+                    if st.form_submit_button("💾 SIMPAN DATA"):
+                        if valid_nik:
                             save_data(
                                 scan_data['number'], 
-                                st.session_state['user_name'], 
+                                input_nik, # Operator NIK
+                                operator_name, # Operator Name
                                 qty, 
+                                scan_data.get('description', ''), # Item Name
                                 scan_data['image_name'],
-                                st.session_state['user_nik'] # Pass Session NIK
+                                st.session_state['user_nik'] # Session NIK
                             )
                             st.session_state['current_scan'] = None # Reset
                             st.rerun()
-                            
-                    with c2:
-                        if st.form_submit_button("❌ BATAL / SCAN ULANG"):
-                            st.session_state['current_scan'] = None
-                            st.rerun()
+                        else:
+                            st.error("⚠️ NIK tidak valid!")
+                        
+                with c2:
+                    if st.form_submit_button("❌ BATAL / RESET"):
+                        st.session_state['current_scan'] = None
+                        st.rerun()
 
-    st.divider()
+elif page == "Riwayat Pengambilan":
+    st.title("📜 Riwayat Pengambilan")
+    
+    # Load Operator Database (Cached) for Mapping
+    @st.cache_data
+    def load_operator_db():
+        db_path = "operator.csv"
+        if os.path.exists(db_path):
+            try:
+                df_op = pd.read_csv(db_path, dtype=str)
+                return df_op
+            except Exception:
+                return None
+        return None
+    
+    df_operators = load_operator_db()
+    
     # Dynamic Data View based on NIK
     nik_str = st.session_state['user_nik']
-    st.subheader(f"Data Hari Ini (NIK: {nik_str})")
+    # st.subheader(f"Data Hari Ini (NIK: {nik_str})") # Removed subheader to be cleaner
     
     user_file_xlsx = f"data_{nik_str}.xlsx"
     user_file_csv = f"data_{nik_str}.csv"
     
     data_found = False
     
+    df = pd.DataFrame()
+    file_type = None
+    
+    # Load Data
     if os.path.exists(user_file_xlsx):
         try:
             df = pd.read_excel(user_file_xlsx)
-            st.dataframe(df.sort_values(by="Timestamp", ascending=False).head(5))
-            data_found = True
+            file_type = 'xlsx'
+        except Exception: pass
+    elif os.path.exists(user_file_csv):
+        try:
+            df = pd.read_csv(user_file_csv, on_bad_lines='skip')
+            file_type = 'csv'
+        except Exception: pass
+        
+    # Display Data
+    if not df.empty:
+        # --- DATE FILTER ---
+        st.caption("Filter Tanggal:")
+        selected_date = st.date_input("Pilih Tanggal", value=datetime.now().date())
+        
+        # Convert Timestamp to datetime objects for filtering
+        try:
+            df['Timestamp_dt'] = pd.to_datetime(df['Timestamp'])
+            df_filtered = df[df['Timestamp_dt'].dt.date == selected_date].copy()
         except Exception:
-            pass
+            df_filtered = df.copy() # Fallback if parsing fails
             
-    if not data_found and os.path.exists(user_file_csv):
-         try:
-             df = pd.read_csv(user_file_csv)
-             st.dataframe(df.sort_values(by="Timestamp", ascending=False).head(5))
-             data_found = True
-         except Exception:
-             pass
-             
-    if not data_found:
-        st.info(f"Belum ada data tersimpan untuk NIK {nik_str}.")
+        if not df_filtered.empty:
+            # --- DETERMINE OPERATOR NAME ---
+            # If 'Nama Operator' exists in saved data, use it. Otherwise map from NIK.
+            if 'Nama Operator' in df_filtered.columns:
+                df_filtered['Operator'] = df_filtered['Nama Operator'].fillna(df_filtered['NIK Operator'])
+            else:
+                # Fallback: Map NIK TO OPERATOR NAME
+                if df_operators is not None:
+                    nik_to_name = dict(zip(df_operators['Personnel Number'], df_operators['Name']))
+                    df_filtered['Operator'] = df_filtered['NIK Operator'].astype(str).map(nik_to_name).fillna(df_filtered['NIK Operator'])
+                else:
+                    df_filtered['Operator'] = df_filtered['NIK Operator']
 
-    with st.expander("Opsi Data"):
-        if st.button("Hapus Data Saya"):
-            try:
-                if os.path.exists(user_file_xlsx):
-                    os.remove(user_file_xlsx)
-                if os.path.exists(user_file_csv):
-                    os.remove(user_file_csv)
-                st.rerun()
-            except Exception as e:
-                st.error(f"Gagal menghapus: {e}")
+            # Select and Rename Columns
+            cols_to_show = ['Timestamp', 'Component Number', 'Nama Barang', 'Quantity', 'Operator']
+            # Ensure columns exist (handle legacy data)
+            existing_cols = [c for c in cols_to_show if c in df_filtered.columns or c == 'Operator']
+            
+            st.dataframe(
+                df_filtered[existing_cols].sort_values(by="Timestamp", ascending=False),
+                column_config={
+                    "Timestamp": "Waktu",
+                    "Component Number": "No. Komponen",
+                    "Nama Barang": "Nama Komponen",
+                    "Quantity": "Qty",
+                    "Operator": "Operator"
+                },
+                hide_index=True,
+                use_container_width=True
+            )
+        else:
+            st.info(f"Tidak ada data untuk tanggal {selected_date.strftime('%d-%m-%Y')}.")
+        
+        st.divider()
+        st.subheader("Hapus Data")
+        with st.expander("Opsi Hapus Data"):
+            # Prepare for deletion (Using original df to allow deleting any data, or filtered? Usually safer to delete from full list or filtered list)
+            # Let's show all data for deletion to be safe/flexible, or just filtered? 
+            # User asked for "data list pengambilan hari ini ditampilkan...", deletion logic was previous request.
+            # I will keep deletion logic on the FULL dataframe for now to allow managing all data, 
+            # OR I can filter it too. Let's keep it on full df but maybe sort by timestamp.
+            
+            # Create a temporary column for display labels
+            # Handle missing columns in legacy data
+            if 'Nama Barang' not in df.columns: df['Nama Barang'] = "-"
+            
+            df['display_label'] = df['Timestamp'].astype(str) + " | " + df['Component Number'].astype(str) + " | " + df['Nama Barang'].astype(str)
+            
+            # Show options in reverse order (newest first)
+            options = df['display_label'].tolist()[::-1]
+            
+            selected_labels = st.multiselect(
+                "Pilih data yang ingin dihapus (Semua Tanggal):",
+                options=options
+            )
+            
+            if st.button("🗑️ Hapus Data Terpilih"):
+                if selected_labels:
+                    try:
+                        # Filter out selected rows
+                        df_remaining = df[~df['display_label'].isin(selected_labels)].drop(columns=['display_label', 'Timestamp_dt'], errors='ignore')
+                        
+                        # Save back to file
+                        if file_type == 'xlsx':
+                            df_remaining.to_excel(user_file_xlsx, index=False)
+                        elif file_type == 'csv':
+                            df_remaining.to_csv(user_file_csv, index=False)
+                            
+                        st.success(f"✅ Berhasil menghapus {len(selected_labels)} data.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"❌ Gagal menghapus: {e}")
+                else:
+                    st.warning("⚠️ Pilih minimal satu data untuk dihapus.")
+    else:
+        st.info(f"Belum ada data tersimpan untuk NIK {nik_str}.")
