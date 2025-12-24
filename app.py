@@ -140,46 +140,7 @@ def load_reader():
 
 reader = load_reader()
 
-# --- THEME LOGIC ---
-def get_theme_css(theme):
-    if theme == "Gelap":
-        return """
-        <style>
-        /* Dark Mode Override */
-        [data-testid="stAppViewContainer"] {
-            background-color: #0e1117;
-            color: #fafafa;
-        }
-        [data-testid="stSidebar"] {
-            background-color: #262730;
-            color: #fafafa;
-        }
-        [data-testid="stHeader"] {
-            background-color: rgba(0,0,0,0);
-        }
-        .stTextInput > div > div > input, .stNumberInput > div > div > input, .stTextArea > div > div > textarea {
-            background-color: #262730;
-            color: #fafafa;
-        }
-        </style>
-        """
-    else:
-        return """
-        <style>
-        /* Light Mode Override (Default-ish but enforced) */
-        [data-testid="stAppViewContainer"] {
-            background-color: #ffffff;
-            color: #31333F;
-        }
-        [data-testid="stSidebar"] {
-            background-color: #f0f2f6;
-            color: #31333F;
-        }
-        [data-testid="stHeader"] {
-            background-color: rgba(0,0,0,0);
-        }
-        </style>
-        """
+
 
 
 def ocr_space_api(image_bytes, api_key='helloworld', language='eng'):
@@ -213,9 +174,7 @@ if st.session_state.get('user_name') != current_user_name:
 # Sidebar Navigation
 st.sidebar.title("Menu")
 
-# Theme Toggle
-theme_choice = st.sidebar.select_slider("Tampilan", options=["Terang", "Gelap"], value="Terang")
-st.markdown(get_theme_css(theme_choice), unsafe_allow_html=True)
+
 
 page = st.sidebar.radio("Pilih Halaman:", ["Scanner", "Riwayat Pengambilan"])
 
