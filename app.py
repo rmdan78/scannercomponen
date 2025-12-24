@@ -123,6 +123,111 @@ def save_data(component_number, operator_nik, operator_name, quantity, item_name
         except Exception:
             pass
 
+# --- GOOGLE SHEETS HELPER FUNCTIONS ---
+def get_worksheet():
+    client = get_gspread_client()
+    if client:
+        try:
+            return client.open("Data Scan").sheet1
+        except gspread.SpreadsheetNotFound:
+            st.error("❌ Spreadsheet 'Data Scan' tidak ditemukan.")
+            return None
+    return None
+
+def load_data_gsheet():
+    sheet = get_worksheet()
+    if sheet:
+        try:
+            # Use get_all_values to get raw list of lists
+            raw_data = sheet.get_all_values()
+            if not raw_data:
+                return pd.DataFrame()
+                
+            # Define expected columns based on save_data order
+            # [Timestamp, NIK Operator, Nama Operator, Component Number, Nama Barang, Quantity, Keterangan]
+            expected_cols = ["Timestamp", "NIK Operator", "Nama Operator", "Component Number", "Nama Barang", "Quantity", "Keterangan"]
+            
+            # Check if first row is header
+            first_row = raw_data[0]
+            # Simple heuristic: Check if "Timestamp" is in the first row (case-insensitive)
+            is_header = False
+            if len(first_row) > 0 and "timestamp" in str(first_row[0]).lower():
+                is_header = True
+            
+            data_rows = raw_data[1:] if is_header else raw_data
+            
+            if not data_rows:
+                 return pd.DataFrame(columns=expected_cols)
+
+            # Create DataFrame
+            # We need to ensure we have enough columns. Pad if necessary.
+            # It's safer to create a list of dicts or just DataFrame from list and rename columns by index
+            df = pd.DataFrame(data_rows)
+            
+            # Rename columns by index (up to len(expected_cols))
+            # If df has more columns, keep them or drop? Let's keep first 7 as known.
+            # If df has fewer, we have a problem, but we can try to map what we have.
+            
+            current_cols = df.columns.tolist()
+            mapping = {}
+            for i in range(min(len(current_cols), len(expected_cols))):
+                mapping[current_cols[i]] = expected_cols[i]
+                
+            df = df.rename(columns=mapping)
+            
+            # Ensure all expected columns exist
+            for col in expected_cols:
+                if col not in df.columns:
+                    df[col] = ""
+                    
+            return df
+        except Exception as e:
+            st.error(f"❌ Gagal memuat data dari Google Sheets: {e}")
+            return pd.DataFrame()
+    return pd.DataFrame()
+
+def delete_data_gsheet(timestamps_to_delete):
+    """
+    Deletes rows from Google Sheets based on Timestamp.
+    Args:
+        timestamps_to_delete (list): List of timestamp strings to delete.
+    """
+    sheet = get_worksheet()
+    if not sheet:
+        return False
+        
+    try:
+        # Optimization: Fetch all timestamps in the sheet to find indices locally
+        # Column 1 is usually Timestamp based on save_data logic
+        timestamps_col = sheet.col_values(1)
+        
+        rows_to_delete = []
+        
+        # Create a map of Timestamp -> [Row Integers]
+        # Skip header if needed, but safe to check all
+        for i, ts in enumerate(timestamps_col):
+            if ts in timestamps_to_delete:
+                rows_to_delete.append(i + 1) # 1-based index for GSpread
+        
+        # Sort descending to avoid index shifting issues
+        rows_to_delete.sort(reverse=True)
+        
+        if not rows_to_delete:
+            st.warning("⚠️ Data tidak ditemukan di Google Sheets untuk dihapus.")
+            return True
+            
+        progress_bar = st.progress(0)
+        total = len(rows_to_delete)
+        
+        for idx, row_num in enumerate(rows_to_delete):
+            sheet.delete_rows(row_num)
+            progress_bar.progress((idx + 1) / total)
+            
+        return True
+    except Exception as e:
+        st.error(f"❌ Error saat menghapus di Google Sheets: {e}")
+        return False
+
 # --- OCR ENGINE SETUP ---
 try:
     import cv2
@@ -411,10 +516,11 @@ if page == "Scanner":
 
 elif page == "Riwayat Pengambilan":
     st.title("📜 Riwayat Pengambilan")
+    st.caption("Data Realtime dari Google Sheets")
     
     # Load Operator Database (Cached) for Mapping
     @st.cache_data
-    def load_operator_db():
+    def load_operator_db_history(): 
         db_path = "operator.csv"
         if os.path.exists(db_path):
             try:
@@ -424,31 +530,11 @@ elif page == "Riwayat Pengambilan":
                 return None
         return None
     
-    df_operators = load_operator_db()
+    df_operators = load_operator_db_history()
     
-    # Dynamic Data View based on NIK
-    nik_str = st.session_state['user_nik']
-    # st.subheader(f"Data Hari Ini (NIK: {nik_str})") # Removed subheader to be cleaner
-    
-    user_file_xlsx = f"data_{nik_str}.xlsx"
-    user_file_csv = f"data_{nik_str}.csv"
-    
-    data_found = False
-    
-    df = pd.DataFrame()
-    file_type = None
-    
-    # Load Data
-    if os.path.exists(user_file_xlsx):
-        try:
-            df = pd.read_excel(user_file_xlsx)
-            file_type = 'xlsx'
-        except Exception: pass
-    elif os.path.exists(user_file_csv):
-        try:
-            df = pd.read_csv(user_file_csv, on_bad_lines='skip')
-            file_type = 'csv'
-        except Exception: pass
+    # --- FETCH DATA FROM GOOGLE SHEETS ---
+    with st.spinner("Mengambil data riwayat dari Google Sheets..."):
+        df = load_data_gsheet()
         
     # Display Data
     if not df.empty:
@@ -458,31 +544,45 @@ elif page == "Riwayat Pengambilan":
         
         # Convert Timestamp to datetime objects for filtering
         try:
-            df['Timestamp_dt'] = pd.to_datetime(df['Timestamp'])
-            df_filtered = df[df['Timestamp_dt'].dt.date == selected_date].copy()
-        except Exception:
-            df_filtered = df.copy() # Fallback if parsing fails
+            # Expected headers matching save_data structure:
+            # Timestamp, NIK Operator, Nama Operator, Component Number, Nama Barang, Quantity, Keterangan
+            if 'Timestamp' in df.columns:
+                df['Timestamp_dt'] = pd.to_datetime(df['Timestamp'], errors='coerce')
+                # Filter valid dates only
+                df_filtered = df[df['Timestamp_dt'].dt.date == selected_date].copy()
+            else:
+                 st.error("⚠️ Format data Google Sheets tidak sesuai (Kolom Timestamp hilang).")
+                 df_filtered = pd.DataFrame()
+        except Exception as e:
+            st.error(f"Error parsing tanggal: {e}")
+            df_filtered = df.copy() # Fallback
             
         if not df_filtered.empty:
             # --- DETERMINE OPERATOR NAME ---
-            # If 'Nama Operator' exists in saved data, use it. Otherwise map from NIK.
+            # If 'Nama Operator' exists, use it. Else map NIK.
             if 'Nama Operator' in df_filtered.columns:
+                 # Check if column is not all NaN
                 df_filtered['Operator'] = df_filtered['Nama Operator'].fillna(df_filtered['NIK Operator'])
             else:
-                # Fallback: Map NIK TO OPERATOR NAME
-                if df_operators is not None:
-                    nik_to_name = dict(zip(df_operators['Personnel Number'], df_operators['Name']))
-                    df_filtered['Operator'] = df_filtered['NIK Operator'].astype(str).map(nik_to_name).fillna(df_filtered['NIK Operator'])
+                # Fallback map
+                if 'NIK Operator' in df_filtered.columns:
+                    if df_operators is not None and 'Personnel Number' in df_operators.columns and 'Name' in df_operators.columns:
+                        nik_to_name = dict(zip(df_operators['Personnel Number'], df_operators['Name']))
+                        df_filtered['Operator'] = df_filtered['NIK Operator'].astype(str).map(nik_to_name).fillna(df_filtered['NIK Operator'])
+                    else:
+                        df_filtered['Operator'] = df_filtered['NIK Operator']
                 else:
-                    df_filtered['Operator'] = df_filtered['NIK Operator']
+                    df_filtered['Operator'] = "-"
 
-            # Select and Rename Columns
+            # Fill missing display columns
+            for col in ['Component Number', 'Nama Barang', 'Quantity', 'Keterangan']:
+                if col not in df_filtered.columns:
+                    df_filtered[col] = "-"
+            
             cols_to_show = ['Timestamp', 'Component Number', 'Nama Barang', 'Quantity', 'Keterangan', 'Operator']
-            # Ensure columns exist (handle legacy data)
-            existing_cols = [c for c in cols_to_show if c in df_filtered.columns or c == 'Operator']
             
             st.dataframe(
-                df_filtered[existing_cols].sort_values(by="Timestamp", ascending=False),
+                df_filtered[cols_to_show].sort_values(by="Timestamp", ascending=False),
                 column_config={
                     "Timestamp": "Waktu",
                     "Component Number": "No. Komponen",
@@ -498,45 +598,61 @@ elif page == "Riwayat Pengambilan":
             st.info(f"Tidak ada data untuk tanggal {selected_date.strftime('%d-%m-%Y')}.")
         
         st.divider()
-        st.subheader("Hapus Data")
+        st.subheader("Hapus Data (Google Sheets)")
+        
+        # Deletion UI
         with st.expander("Opsi Hapus Data"):
-            # Prepare for deletion (Using original df to allow deleting any data, or filtered? Usually safer to delete from full list or filtered list)
-            # Let's show all data for deletion to be safe/flexible, or just filtered? 
-            # User asked for "data list pengambilan hari ini ditampilkan...", deletion logic was previous request.
-            # I will keep deletion logic on the FULL dataframe for now to allow managing all data, 
-            # OR I can filter it too. Let's keep it on full df but maybe sort by timestamp.
-            
-            # Create a temporary column for display labels
-            # Handle missing columns in legacy data
-            if 'Nama Barang' not in df.columns: df['Nama Barang'] = "-"
-            
+            # Create labels
+            # Ensure columns exist
+            for c in ['Timestamp', 'Component Number', 'Nama Barang']:
+                if c not in df.columns: df[c] = "?"
+                
             df['display_label'] = df['Timestamp'].astype(str) + " | " + df['Component Number'].astype(str) + " | " + df['Nama Barang'].astype(str)
             
-            # Show options in reverse order (newest first)
+            # Show options (Newest First)
             options = df['display_label'].tolist()[::-1]
             
             selected_labels = st.multiselect(
-                "Pilih data yang ingin dihapus (Semua Tanggal):",
+                "Pilih data yang ingin dihapus (Permanen):",
                 options=options
             )
             
             if st.button("🗑️ Hapus Data Terpilih"):
                 if selected_labels:
-                    try:
-                        # Filter out selected rows
-                        df_remaining = df[~df['display_label'].isin(selected_labels)].drop(columns=['display_label', 'Timestamp_dt'], errors='ignore')
+                    # Extract Timestamps
+                    timestamps_to_delete = [label.split(" | ")[0] for label in selected_labels]
+                    
+                    with st.spinner("Menghapus data dari Cloud..."):
+                        success = delete_data_gsheet(timestamps_to_delete)
+                    
+                    if success:
+                        st.success(f"✅ {len(selected_labels)} data berhasil dihapus dari Google Sheets.")
                         
-                        # Save back to file
-                        if file_type == 'xlsx':
-                            df_remaining.to_excel(user_file_xlsx, index=False)
-                        elif file_type == 'csv':
-                            df_remaining.to_csv(user_file_csv, index=False)
-                            
-                        st.success(f"✅ Berhasil menghapus {len(selected_labels)} data.")
+                        # --- LOCAL SYNC (Optional but recommended) ---
+                        # Try to clean up local file too
+                        try:
+                            nik_str = st.session_state['user_nik']
+                            # Check both xlsx and csv
+                            for ext in ['xlsx', 'csv']:
+                                fpath = f"data_{nik_str}.{ext}"
+                                if os.path.exists(fpath):
+                                    if ext == 'xlsx':
+                                        dfl = pd.read_excel(fpath)
+                                    else:
+                                        dfl = pd.read_csv(fpath)
+                                    
+                                    # Filter
+                                    if 'Timestamp' in dfl.columns:
+                                        # Use string matching
+                                        dfl = dfl[~dfl['Timestamp'].astype(str).isin(timestamps_to_delete)]
+                                        
+                                        if ext == 'xlsx': dfl.to_excel(fpath, index=False, engine='openpyxl') # explicit engine often safer
+                                        else: dfl.to_csv(fpath, index=False)
+                        except Exception:
+                            pass # Minimize error spam
+                        
                         st.rerun()
-                    except Exception as e:
-                        st.error(f"❌ Gagal menghapus: {e}")
                 else:
-                    st.warning("⚠️ Pilih minimal satu data untuk dihapus.")
+                    st.warning("⚠️ Pilih data dahulu.")
     else:
-        st.info(f"Belum ada data tersimpan untuk NIK {nik_str}.")
+        st.info("Belum ada data di Google Sheets.")
